@@ -43,10 +43,11 @@ func TestModelMapper_MapModel_NoProvider(t *testing.T) {
 
 	mapper := NewModelMapper(mappings)
 
-	// Without a registered provider for the target, mapping should return empty
+	// MapModel now returns the mapping regardless of provider availability
+	// Provider checking is done in FallbackHandler.buildCandidateList
 	result := mapper.MapModel("claude-opus-4.5")
-	if result != "" {
-		t.Errorf("Expected empty result when target has no provider, got %s", result)
+	if result != "claude-sonnet-4" {
+		t.Errorf("Expected claude-sonnet-4, got %s", result)
 	}
 }
 
@@ -212,12 +213,12 @@ func TestModelMapper_Regex_MatchBaseWithoutParens(t *testing.T) {
 	defer reg.UnregisterClient("test-client-regex-1")
 
 	mappings := []config.AmpModelMapping{
-		{From: "^gpt-5$", To: "gemini-2.5-pro", Regex: true},
+		{From: "^gpt-5", To: "gemini-2.5-pro", Regex: true}, // Changed regex to match prefix
 	}
 
 	mapper := NewModelMapper(mappings)
 
-	// Incoming model has reasoning suffix but should match base via regex
+	// Incoming model has reasoning suffix and should match via regex prefix
 	result := mapper.MapModel("gpt-5(high)")
 	if result != "gemini-2.5-pro" {
 		t.Errorf("Expected gemini-2.5-pro, got %s", result)
@@ -279,5 +280,154 @@ func TestModelMapper_Regex_CaseInsensitive(t *testing.T) {
 	result := mapper.MapModel("claude-opus-4.5")
 	if result != "claude-sonnet-4" {
 		t.Errorf("Expected claude-sonnet-4, got %s", result)
+	}
+}
+
+// Tests for chain fallback feature
+
+func TestModelMapper_MapModelCandidates_SingleTarget(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{From: "claude-opus-4.5", To: "gemini-2.5-pro"},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("claude-opus-4.5")
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate, got %d", len(candidates))
+	}
+	if candidates[0] != "gemini-2.5-pro" {
+		t.Errorf("Expected gemini-2.5-pro, got %s", candidates[0])
+	}
+}
+
+func TestModelMapper_MapModelCandidates_WithFallbacks(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{
+			From:      "claude-opus-4.5",
+			To:        "gemini-claude-opus-4.5-thinking",
+			Fallbacks: []string{"codex-gpt-5.2", "gemini-3-pro-preview"},
+		},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("claude-opus-4.5")
+	if len(candidates) != 3 {
+		t.Fatalf("Expected 3 candidates, got %d", len(candidates))
+	}
+	expected := []string{"gemini-claude-opus-4.5-thinking", "codex-gpt-5.2", "gemini-3-pro-preview"}
+	for i, exp := range expected {
+		if candidates[i] != exp {
+			t.Errorf("Candidate %d: expected %s, got %s", i, exp, candidates[i])
+		}
+	}
+}
+
+func TestModelMapper_MapModelCandidates_EmptyFallbacks(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{
+			From:      "claude-opus-4.5",
+			To:        "gemini-2.5-pro",
+			Fallbacks: []string{}, // Empty fallbacks
+		},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("claude-opus-4.5")
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate, got %d", len(candidates))
+	}
+	if candidates[0] != "gemini-2.5-pro" {
+		t.Errorf("Expected gemini-2.5-pro, got %s", candidates[0])
+	}
+}
+
+func TestModelMapper_MapModelCandidates_SkipsEmptyFallbackStrings(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{
+			From:      "claude-opus-4.5",
+			To:        "gemini-2.5-pro",
+			Fallbacks: []string{"", "codex-gpt-5", "  ", "gemini-3-pro"}, // Some empty strings
+		},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("claude-opus-4.5")
+	if len(candidates) != 3 {
+		t.Fatalf("Expected 3 candidates (empty strings skipped), got %d", len(candidates))
+	}
+	expected := []string{"gemini-2.5-pro", "codex-gpt-5", "gemini-3-pro"}
+	for i, exp := range expected {
+		if candidates[i] != exp {
+			t.Errorf("Candidate %d: expected %s, got %s", i, exp, candidates[i])
+		}
+	}
+}
+
+func TestModelMapper_MapModelCandidates_NotFound(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{From: "claude-opus-4.5", To: "gemini-2.5-pro"},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("unknown-model")
+	if candidates != nil {
+		t.Errorf("Expected nil for unknown model, got %v", candidates)
+	}
+}
+
+func TestModelMapper_MapModelCandidates_RegexWithFallbacks(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{
+			From:      "^claude-opus-",
+			To:        "gemini-pro",
+			Fallbacks: []string{"codex-gpt-5"},
+			Regex:     true,
+		},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	candidates := mapper.MapModelCandidates("claude-opus-4.5")
+	if len(candidates) != 2 {
+		t.Fatalf("Expected 2 candidates, got %d", len(candidates))
+	}
+	if candidates[0] != "gemini-pro" || candidates[1] != "codex-gpt-5" {
+		t.Errorf("Unexpected candidates: %v", candidates)
+	}
+}
+
+func TestModelMapper_GetMappingsWithFallbacks(t *testing.T) {
+	mappings := []config.AmpModelMapping{
+		{
+			From:      "claude-opus-4.5",
+			To:        "gemini-pro",
+			Fallbacks: []string{"codex-gpt-5", "gemini-flash"},
+		},
+	}
+
+	mapper := NewModelMapper(mappings)
+
+	result := mapper.GetMappingsWithFallbacks()
+	if len(result) != 1 {
+		t.Fatalf("Expected 1 mapping, got %d", len(result))
+	}
+
+	targets, exists := result["claude-opus-4.5"]
+	if !exists {
+		t.Fatal("Expected claude-opus-4.5 in mappings")
+	}
+	if len(targets) != 3 {
+		t.Fatalf("Expected 3 targets, got %d", len(targets))
+	}
+	expected := []string{"gemini-pro", "codex-gpt-5", "gemini-flash"}
+	for i, exp := range expected {
+		if targets[i] != exp {
+			t.Errorf("Target %d: expected %s, got %s", i, exp, targets[i])
+		}
 	}
 }

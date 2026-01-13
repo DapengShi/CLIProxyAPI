@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
@@ -30,6 +31,95 @@ const (
 
 // MappedModelContextKey is the Gin context key for passing mapped model names.
 const MappedModelContextKey = "mapped_model"
+
+// modelCandidate represents a candidate model for chain fallback
+type modelCandidate struct {
+	Model      string   // Full model name (with thinking suffix if applicable)
+	Providers  []string // Available providers for this model
+	ViaMapping bool     // Whether this candidate came from a mapping
+}
+
+// fallbackResponseWriter wraps http.ResponseWriter to capture status and detect quota errors
+type fallbackResponseWriter struct {
+	gin.ResponseWriter
+	statusCode    int
+	bodyBuffer    bytes.Buffer
+	headerWritten bool
+	isQuotaError  bool
+}
+
+func newFallbackResponseWriter(w gin.ResponseWriter) *fallbackResponseWriter {
+	return &fallbackResponseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+	}
+}
+
+func (w *fallbackResponseWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.headerWritten = true
+	// Don't write to underlying writer yet - we may need to retry
+}
+
+func (w *fallbackResponseWriter) Write(data []byte) (int, error) {
+	// Buffer the data to check for quota errors
+	w.bodyBuffer.Write(data)
+	return len(data), nil
+}
+
+func (w *fallbackResponseWriter) Status() int {
+	return w.statusCode
+}
+
+func (w *fallbackResponseWriter) Written() bool {
+	return w.headerWritten
+}
+
+// isRetryableError checks if the response indicates a quota/rate limit error that should trigger fallback
+func (w *fallbackResponseWriter) isRetryableError() bool {
+	// Check HTTP status codes that indicate quota/rate limiting
+	switch w.statusCode {
+	case http.StatusTooManyRequests, // 429
+		http.StatusForbidden,      // 403 (often used for quota exceeded)
+		http.StatusServiceUnavailable, // 503
+		http.StatusBadGateway:     // 502
+		return true
+	}
+
+	// Check response body for quota-related error messages
+	body := w.bodyBuffer.String()
+	quotaPatterns := []string{
+		"quota", "rate_limit", "rate limit", "too many requests",
+		"insufficient_quota", "resource_exhausted", "capacity",
+		"RESOURCE_EXHAUSTED", "RATE_LIMIT_EXCEEDED",
+	}
+	lowerBody := strings.ToLower(body)
+	for _, pattern := range quotaPatterns {
+		if strings.Contains(lowerBody, strings.ToLower(pattern)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// flush writes buffered response to the underlying writer
+func (w *fallbackResponseWriter) flush() {
+	if w.headerWritten {
+		w.ResponseWriter.WriteHeader(w.statusCode)
+	}
+	if w.bodyBuffer.Len() > 0 {
+		w.ResponseWriter.Write(w.bodyBuffer.Bytes())
+	}
+}
+
+// reset clears the buffer for retry
+func (w *fallbackResponseWriter) reset() {
+	w.bodyBuffer.Reset()
+	w.headerWritten = false
+	w.statusCode = http.StatusOK
+	w.isQuotaError = false
+}
 
 // logAmpRouting logs the routing decision for an Amp request with structured fields
 func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provider, path string) {
@@ -110,6 +200,7 @@ func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
 // If the model's provider is not configured in CLIProxyAPI, it forwards to ampcode.com
+// Supports chain fallback: tries multiple candidate models in order until one succeeds
 func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestPath := c.Request.URL.Path
@@ -140,133 +231,176 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			thinkingSuffix = modelName[len(normalizedModel):]
 		}
 
-		resolveMappedModel := func() (string, []string) {
-			if fh.modelMapper == nil {
-				return "", nil
-			}
-
-			mappedModel := fh.modelMapper.MapModel(modelName)
-			if mappedModel == "" {
-				mappedModel = fh.modelMapper.MapModel(normalizedModel)
-			}
-			mappedModel = strings.TrimSpace(mappedModel)
-			if mappedModel == "" {
-				return "", nil
-			}
-
-			// Preserve dynamic thinking suffix (e.g. "(xhigh)") when mapping applies, unless the target
-			// already specifies its own thinking suffix.
-			if thinkingSuffix != "" {
-				_, mappedThinkingMetadata := util.NormalizeThinkingModel(mappedModel)
-				if mappedThinkingMetadata == nil {
-					mappedModel += thinkingSuffix
-				}
-			}
-
-			mappedBaseModel, _ := util.NormalizeThinkingModel(mappedModel)
-			mappedProviders := util.GetProviderName(mappedBaseModel)
-			if len(mappedProviders) == 0 {
-				return "", nil
-			}
-
-			return mappedModel, mappedProviders
-		}
-
-		// Track resolved model for logging (may change if mapping is applied)
-		resolvedModel := normalizedModel
-		usedMapping := false
-		var providers []string
-
-		// Check if model mappings should be forced ahead of local API keys
+		// Build candidate list based on force mode
 		forceMappings := fh.forceModelMappings != nil && fh.forceModelMappings()
+		candidates := fh.buildCandidateList(modelName, normalizedModel, thinkingSuffix, forceMappings)
 
-		if forceMappings {
-			// FORCE MODE: Check model mappings FIRST (takes precedence over local API keys)
-			// This allows users to route Amp requests to their preferred OAuth providers
-			if mappedModel, mappedProviders := resolveMappedModel(); mappedModel != "" {
-				// Mapping found and provider available - rewrite the model in request body
-				bodyBytes = rewriteModelInRequest(bodyBytes, mappedModel)
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				// Store mapped model in context for handlers that check it (like gemini bridge)
-				c.Set(MappedModelContextKey, mappedModel)
-				resolvedModel = mappedModel
-				usedMapping = true
-				providers = mappedProviders
-			}
-
-			// If no mapping applied, check for local providers
-			if !usedMapping {
-				providers = util.GetProviderName(normalizedModel)
-			}
-		} else {
-			// DEFAULT MODE: Check local providers first, then mappings as fallback
-			providers = util.GetProviderName(normalizedModel)
-
-			if len(providers) == 0 {
-				// No providers configured - check if we have a model mapping
-				if mappedModel, mappedProviders := resolveMappedModel(); mappedModel != "" {
-					// Mapping found and provider available - rewrite the model in request body
-					bodyBytes = rewriteModelInRequest(bodyBytes, mappedModel)
-					c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-					// Store mapped model in context for handlers that check it (like gemini bridge)
-					c.Set(MappedModelContextKey, mappedModel)
-					resolvedModel = mappedModel
-					usedMapping = true
-					providers = mappedProviders
-				}
-			}
-		}
-
-		// If no providers available, fallback to ampcode.com
-		if len(providers) == 0 {
+		// If no candidates available, fallback to ampcode.com
+		if len(candidates) == 0 {
 			proxy := fh.getProxy()
 			if proxy != nil {
-				// Log: Forwarding to ampcode.com (uses Amp credits)
 				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
-
-				// Restore body again for the proxy
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-				// Forward to ampcode.com
 				proxy.ServeHTTP(c.Writer, c.Request)
 				return
 			}
-
-			// No proxy available, let the normal handler return the error
 			logAmpRouting(RouteTypeNoProvider, modelName, "", "", requestPath)
+			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			handler(c)
+			return
 		}
 
-		// Log the routing decision
-		providerName := ""
-		if len(providers) > 0 {
-			providerName = providers[0]
+		// Try each candidate in order (chain fallback)
+		originalWriter := c.Writer
+		var lastError *fallbackResponseWriter
+
+		for i, cand := range candidates {
+			// Prepare request body with candidate model
+			candidateBody := bodyBytes
+			if cand.ViaMapping {
+				candidateBody = rewriteModelInRequest(bodyBytes, cand.Model)
+				c.Set(MappedModelContextKey, cand.Model)
+			}
+
+			// Create fallback-aware response writer to capture response
+			fw := newFallbackResponseWriter(originalWriter)
+			c.Writer = fw
+
+			// Filter Anthropic-Beta header for local handling
+			filterAntropicBetaHeader(c)
+			c.Request.Body = io.NopCloser(bytes.NewReader(candidateBody))
+
+			// Wrap with response rewriter if using mapping
+			if cand.ViaMapping {
+				rewriter := NewResponseRewriter(fw, modelName)
+				c.Writer = rewriter
+
+				// Log routing decision
+				providerName := ""
+				if len(cand.Providers) > 0 {
+					providerName = cand.Providers[0]
+				}
+				log.Debugf("amp chain fallback: trying candidate %d/%d: %s -> %s", i+1, len(candidates), modelName, cand.Model)
+				logAmpRouting(RouteTypeModelMapping, modelName, cand.Model, providerName, requestPath)
+
+				handler(c)
+				rewriter.Flush()
+
+				// Check if response indicates quota/rate limit error
+				if fw.isRetryableError() && i < len(candidates)-1 {
+					log.Warnf("amp chain fallback: candidate %s failed (quota/rate limit), trying next candidate", cand.Model)
+					fw.reset()
+					continue
+				}
+
+				// Success or last candidate - flush response
+				fw.flush()
+				return
+			} else {
+				// Direct local provider (no mapping)
+				providerName := ""
+				if len(cand.Providers) > 0 {
+					providerName = cand.Providers[0]
+				}
+				log.Debugf("amp chain fallback: trying candidate %d/%d: %s (local)", i+1, len(candidates), cand.Model)
+				logAmpRouting(RouteTypeLocalProvider, modelName, cand.Model, providerName, requestPath)
+
+				handler(c)
+
+				// Check if response indicates quota/rate limit error
+				if fw.isRetryableError() && i < len(candidates)-1 {
+					log.Warnf("amp chain fallback: candidate %s failed (quota/rate limit), trying next candidate", cand.Model)
+					fw.reset()
+					continue
+				}
+
+				// Success or last candidate - flush response
+				fw.flush()
+				return
+			}
 		}
 
-		if usedMapping {
-			// Log: Model was mapped to another model
-			log.Debugf("amp model mapping: request %s -> %s", normalizedModel, resolvedModel)
-			logAmpRouting(RouteTypeModelMapping, modelName, resolvedModel, providerName, requestPath)
-			rewriter := NewResponseRewriter(c.Writer, modelName)
-			c.Writer = rewriter
-			// Filter Anthropic-Beta header only for local handling paths
-			filterAntropicBetaHeader(c)
-			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			handler(c)
-			rewriter.Flush()
-			log.Debugf("amp model mapping: response %s -> %s", resolvedModel, modelName)
-		} else if len(providers) > 0 {
-			// Log: Using local provider (free)
-			logAmpRouting(RouteTypeLocalProvider, modelName, resolvedModel, providerName, requestPath)
-			// Filter Anthropic-Beta header only for local handling paths
-			filterAntropicBetaHeader(c)
-			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			handler(c)
-		} else {
-			// No provider, no mapping, no proxy: fall back to the wrapped handler so it can return an error response
-			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			handler(c)
+		// All candidates failed, try ampcode.com as last resort
+		if lastError != nil && lastError.isRetryableError() {
+			proxy := fh.getProxy()
+			if proxy != nil {
+				log.Warnf("amp chain fallback: all local candidates exhausted, forwarding to ampcode.com")
+				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+				c.Writer = originalWriter
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				proxy.ServeHTTP(c.Writer, c.Request)
+				return
+			}
 		}
 	}
+}
+
+// buildCandidateList builds an ordered list of candidate models to try
+func (fh *FallbackHandler) buildCandidateList(modelName, normalizedModel, thinkingSuffix string, forceMappings bool) []modelCandidate {
+	var candidates []modelCandidate
+
+	// Helper to add mapped candidates from the mapper
+	addMappedCandidates := func() {
+		if fh.modelMapper == nil {
+			return
+		}
+
+		// Try to get candidates for the full model name first, then normalized
+		mappedModels := fh.modelMapper.MapModelCandidates(modelName)
+		if len(mappedModels) == 0 {
+			mappedModels = fh.modelMapper.MapModelCandidates(normalizedModel)
+		}
+
+		for _, mapped := range mappedModels {
+			mapped = strings.TrimSpace(mapped)
+			if mapped == "" {
+				continue
+			}
+
+			// Preserve dynamic thinking suffix if target doesn't have one
+			if thinkingSuffix != "" {
+				_, mappedThinkingMetadata := util.NormalizeThinkingModel(mapped)
+				if mappedThinkingMetadata == nil {
+					mapped += thinkingSuffix
+				}
+			}
+
+			// Check if this candidate has available providers
+			mappedBase, _ := util.NormalizeThinkingModel(mapped)
+			providers := util.GetProviderName(mappedBase)
+			if len(providers) > 0 {
+				candidates = append(candidates, modelCandidate{
+					Model:      mapped,
+					Providers:  providers,
+					ViaMapping: true,
+				})
+			}
+		}
+	}
+
+	// Helper to add direct local provider if available
+	addLocalCandidate := func() {
+		providers := util.GetProviderName(normalizedModel)
+		if len(providers) > 0 {
+			candidates = append(candidates, modelCandidate{
+				Model:      modelName,
+				Providers:  providers,
+				ViaMapping: false,
+			})
+		}
+	}
+
+	if forceMappings {
+		// FORCE MODE: mappings first, then local provider
+		addMappedCandidates()
+		addLocalCandidate()
+	} else {
+		// DEFAULT MODE: local provider first, then mappings
+		addLocalCandidate()
+		addMappedCandidates()
+	}
+
+	return candidates
 }
 
 // filterAntropicBetaHeader filters Anthropic-Beta header to remove features requiring special subscription

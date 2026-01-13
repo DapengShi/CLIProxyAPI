@@ -166,6 +166,11 @@ type AmpModelMapping struct {
 	// The target model must have available providers in the registry.
 	To string `yaml:"to" json:"to"`
 
+	// Fallbacks is an ordered list of fallback models to try if the primary target (To)
+	// fails due to quota exceeded or rate limiting. Models are tried in order until
+	// one succeeds or all fail. If all fail, the request falls back to ampcode.com.
+	Fallbacks []string `yaml:"fallbacks,omitempty" json:"fallbacks,omitempty"`
+
 	// Regex indicates whether the 'from' field should be interpreted as a regular
 	// expression for matching model names. When true, this mapping is evaluated
 	// after exact matches and in the order provided. Defaults to false (exact match).
