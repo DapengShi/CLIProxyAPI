@@ -117,6 +117,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 
+	// Ensure assistant messages start with thinking block when thinking is enabled
+	body = ensureAssistantMessagesHaveThinkingBlock(body)
+
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
 	body = ensureMaxTokensForThinking(model, body)
 
@@ -245,6 +248,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
+
+	// Ensure assistant messages start with thinking block when thinking is enabled
+	body = ensureAssistantMessagesHaveThinkingBlock(body)
 
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
 	body = ensureMaxTokensForThinking(model, body)
@@ -584,6 +590,76 @@ func ensureMaxTokensForThinking(modelName string, body []byte) []byte {
 	if maxTokens < requiredMaxTokens {
 		body, _ = sjson.SetBytes(body, "max_tokens", requiredMaxTokens)
 	}
+	return body
+}
+
+// redactedThinkingBlock is a pre-parsed block used for injection
+// when assistant messages don't start with a thinking block
+var redactedThinkingBlock = map[string]interface{}{
+	"type": "redacted_thinking",
+}
+
+// ensureAssistantMessagesHaveThinkingBlock ensures all assistant messages start with a thinking block
+// when thinking is enabled. Claude API requires this constraint; violating it returns a 400 error:
+// "When thinking is enabled, assistant messages must start with thinking or redacted_thinking block"
+func ensureAssistantMessagesHaveThinkingBlock(body []byte) []byte {
+	// Check if thinking is enabled
+	thinkingType := gjson.GetBytes(body, "thinking.type").String()
+	if thinkingType != "enabled" {
+		return body
+	}
+
+	// Iterate through messages to check assistant messages
+	messagesResult := gjson.GetBytes(body, "messages")
+	if !messagesResult.Exists() || !messagesResult.IsArray() {
+		return body
+	}
+
+	messages := messagesResult.Array()
+	modifiedCount := 0
+
+	for i, msg := range messages {
+		role := msg.Get("role").String()
+		if role != "assistant" {
+			continue
+		}
+
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		contentArray := content.Array()
+		if len(contentArray) == 0 {
+			continue
+		}
+
+		// Check if first content block is a thinking block
+		firstType := contentArray[0].Get("type").String()
+		if firstType == "thinking" || firstType == "redacted_thinking" {
+			continue
+		}
+
+		// Build new content array with thinking block first
+		newContent := make([]interface{}, 0, len(contentArray)+1)
+		newContent = append(newContent, redactedThinkingBlock)
+		for _, c := range contentArray {
+			newContent = append(newContent, c.Value())
+		}
+
+		var err error
+		body, err = sjson.SetBytes(body, fmt.Sprintf("messages.%d.content", i), newContent)
+		if err != nil {
+			log.Warnf("ensureAssistantMessagesHaveThinkingBlock: failed to inject thinking block at message %d: %v", i, err)
+			continue // Continue processing other messages; retry may succeed
+		}
+		modifiedCount++
+	}
+
+	if modifiedCount > 0 {
+		log.Debugf("ensureAssistantMessagesHaveThinkingBlock: injected %d thinking block(s)", modifiedCount)
+	}
+
 	return body
 }
 

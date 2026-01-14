@@ -49,3 +49,97 @@ func TestStripClaudeToolPrefixFromStreamLine(t *testing.T) {
 		t.Fatalf("content_block.name = %q, want %q", got, "alpha")
 	}
 }
+
+func TestEnsureAssistantMessagesHaveThinkingBlock(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		expectModified bool
+		wantFirstType  string
+	}{
+		{
+			name:           "no thinking enabled",
+			input:          `{"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"test"}]}]}`,
+			expectModified: false,
+			wantFirstType:  "tool_use",
+		},
+		{
+			name:           "thinking enabled, already has thinking block",
+			input:          `{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"test"},{"type":"tool_use","name":"test"}]}]}`,
+			expectModified: false,
+			wantFirstType:  "thinking",
+		},
+		{
+			name:           "thinking enabled, tool_use first needs injection",
+			input:          `{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"test"}]}]}`,
+			expectModified: true,
+			wantFirstType:  "redacted_thinking",
+		},
+		{
+			name:           "thinking enabled, text first needs injection",
+			input:          `{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"text","text":"hello"}]}]}`,
+			expectModified: true,
+			wantFirstType:  "redacted_thinking",
+		},
+		{
+			name:           "thinking enabled, redacted_thinking is valid",
+			input:          `{"thinking":{"type":"enabled"},"messages":[{"role":"assistant","content":[{"type":"redacted_thinking"},{"type":"tool_use","name":"test"}]}]}`,
+			expectModified: false,
+			wantFirstType:  "redacted_thinking",
+		},
+		{
+			name:           "user message not modified",
+			input:          `{"thinking":{"type":"enabled"},"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`,
+			expectModified: false,
+			wantFirstType:  "text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte(tt.input)
+			output := ensureAssistantMessagesHaveThinkingBlock(input)
+
+			// Check if first content type matches expected
+			firstType := gjson.GetBytes(output, "messages.0.content.0.type").String()
+			if firstType != tt.wantFirstType {
+				t.Errorf("first content type = %q, want %q", firstType, tt.wantFirstType)
+			}
+
+			// Verify modification happened as expected
+			modified := !bytes.Equal(input, output)
+			if modified != tt.expectModified {
+				t.Errorf("modified = %v, want %v", modified, tt.expectModified)
+			}
+		})
+	}
+}
+
+func TestEnsureAssistantMessagesHaveThinkingBlock_MultipleAssistants(t *testing.T) {
+	input := `{"thinking":{"type":"enabled"},"messages":[
+		{"role":"user","content":[{"type":"text","text":"hello"}]},
+		{"role":"assistant","content":[{"type":"tool_use","name":"test1"}]},
+		{"role":"user","content":[{"type":"text","text":"continue"}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok"}]}
+	]}`
+
+	output := ensureAssistantMessagesHaveThinkingBlock([]byte(input))
+
+	// Check first assistant message (index 1)
+	firstType := gjson.GetBytes(output, "messages.1.content.0.type").String()
+	if firstType != "redacted_thinking" {
+		t.Errorf("messages[1] first content type = %q, want %q", firstType, "redacted_thinking")
+	}
+
+	// Check second assistant message (index 3)
+	secondType := gjson.GetBytes(output, "messages.3.content.0.type").String()
+	if secondType != "redacted_thinking" {
+		t.Errorf("messages[3] first content type = %q, want %q", secondType, "redacted_thinking")
+	}
+
+	// Verify original content is preserved after the injected block
+	toolType := gjson.GetBytes(output, "messages.1.content.1.type").String()
+	if toolType != "tool_use" {
+		t.Errorf("messages[1] second content type = %q, want %q", toolType, "tool_use")
+	}
+}
