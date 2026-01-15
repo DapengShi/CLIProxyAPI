@@ -9,16 +9,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
-type usageExportPayload struct {
-	Version    int                      `json:"version"`
-	ExportedAt time.Time                `json:"exported_at"`
-	Usage      usage.StatisticsSnapshot `json:"usage"`
-}
-
-type usageImportPayload struct {
-	Version int                      `json:"version"`
-	Usage   usage.StatisticsSnapshot `json:"usage"`
-}
 
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
@@ -38,7 +28,7 @@ func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 	if h != nil && h.usageStats != nil {
 		snapshot = h.usageStats.Snapshot()
 	}
-	c.JSON(http.StatusOK, usageExportPayload{
+	c.JSON(http.StatusOK, usage.ExportPayload{
 		Version:    1,
 		ExportedAt: time.Now().UTC(),
 		Usage:      snapshot,
@@ -58,7 +48,7 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		return
 	}
 
-	var payload usageImportPayload
+	var payload usage.ImportPayload
 	if err := json.Unmarshal(data, &payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return

@@ -423,6 +423,7 @@ func main() {
 	} else {
 		cfg.AuthDir = resolvedAuthDir
 	}
+
 	managementasset.SetCurrentConfig(cfg)
 
 	// Create login options to be used in authentication flows.
