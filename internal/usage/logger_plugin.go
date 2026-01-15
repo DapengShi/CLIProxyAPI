@@ -6,6 +6,7 @@ package usage
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -118,6 +119,17 @@ type StatisticsSnapshot struct {
 	RequestsByHour map[string]int64 `json:"requests_by_hour"`
 	TokensByDay    map[string]int64 `json:"tokens_by_day"`
 	TokensByHour   map[string]int64 `json:"tokens_by_hour"`
+}
+
+type ExportPayload struct {
+	Version    int                `json:"version"`
+	ExportedAt time.Time          `json:"exported_at"`
+	Usage      StatisticsSnapshot `json:"usage"`
+}
+
+type ImportPayload struct {
+	Version int                `json:"version"`
+	Usage   StatisticsSnapshot `json:"usage"`
 }
 
 // APISnapshot summarises metrics for a single API key.
@@ -341,7 +353,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				s.recordImported(modelName, stats, detail)
 				result.Added++
 			}
 		}
@@ -350,7 +362,78 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	return result
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
+// Replace swaps the in-memory statistics with the provided snapshot.
+func (s *RequestStatistics) Replace(snapshot StatisticsSnapshot) {
+	if s == nil {
+		return
+	}
+	for _, apiSnapshot := range snapshot.APIs {
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelSnapshot.Details = nil
+			apiSnapshot.Models[modelName] = modelSnapshot
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totalRequests = snapshot.TotalRequests
+	s.successCount = snapshot.SuccessCount
+	s.failureCount = snapshot.FailureCount
+	s.totalTokens = snapshot.TotalTokens
+
+	s.apis = make(map[string]*apiStats, len(snapshot.APIs))
+	for apiName, apiSnapshot := range snapshot.APIs {
+		stats := &apiStats{TotalRequests: apiSnapshot.TotalRequests, TotalTokens: apiSnapshot.TotalTokens}
+		if len(apiSnapshot.Models) > 0 {
+			stats.Models = make(map[string]*modelStats, len(apiSnapshot.Models))
+			for modelName, modelSnapshot := range apiSnapshot.Models {
+				modelStatsValue := &modelStats{
+					TotalRequests: modelSnapshot.TotalRequests,
+					TotalTokens:   modelSnapshot.TotalTokens,
+					Details:       nil,
+				}
+				stats.Models[modelName] = modelStatsValue
+			}
+		} else {
+			stats.Models = make(map[string]*modelStats)
+		}
+		s.apis[apiName] = stats
+	}
+
+	s.requestsByDay = copyStringInt64Map(snapshot.RequestsByDay)
+	s.requestsByHour = copyHourSnapshot(snapshot.RequestsByHour)
+	s.tokensByDay = copyStringInt64Map(snapshot.TokensByDay)
+	s.tokensByHour = copyHourSnapshot(snapshot.TokensByHour)
+}
+
+func copyStringInt64Map(src map[string]int64) map[string]int64 {
+	if len(src) == 0 {
+		return make(map[string]int64)
+	}
+	out := make(map[string]int64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func copyHourSnapshot(src map[string]int64) map[int]int64 {
+	out := make(map[int]int64, len(src))
+	for k, v := range src {
+		hour, err := strconv.Atoi(strings.TrimSpace(k))
+		if err != nil {
+			continue
+		}
+		if hour < 0 {
+			hour = 0
+		}
+		out[hour%24] += v
+	}
+	return out
+}
+
+func (s *RequestStatistics) recordImported(modelName string, stats *apiStats, detail RequestDetail) {
 	totalTokens := detail.Tokens.TotalTokens
 	if totalTokens < 0 {
 		totalTokens = 0
@@ -468,5 +551,8 @@ func formatHour(hour int) string {
 		hour = 0
 	}
 	hour = hour % 24
-	return fmt.Sprintf("%02d", hour)
+	if hour < 10 {
+		return "0" + strconv.Itoa(hour)
+	}
+	return strconv.Itoa(hour)
 }

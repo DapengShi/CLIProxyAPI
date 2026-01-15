@@ -12,6 +12,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
@@ -41,6 +42,17 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 			log.Warn("keep-alive endpoint idle for 10s, shutting down")
 			keepAliveCancel()
 		}))
+	}
+
+	statsPath := usage.StatsFilePath(cfg.AuthDir)
+	if cfg.UsageStatisticsEnabled && cfg.UsageStatisticsPersistEnabled {
+		if statsPath == "" {
+			log.Warn("usage statistics persistence enabled but auth-dir is empty; persistence disabled")
+		} else if err := usage.GetRequestStatistics().LoadFromFile(statsPath); err != nil {
+			log.WithError(err).Warn("failed to load usage statistics")
+		}
+		interval := time.Duration(cfg.UsageStatisticsSaveIntervalSeconds) * time.Second
+		usage.GetRequestStatistics().StartAutoSave(runCtx, statsPath, interval)
 	}
 
 	service, err := builder.Build()
