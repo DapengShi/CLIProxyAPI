@@ -53,6 +53,11 @@ type Config struct {
 
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
+	// UsageStatisticsPersistEnabled controls whether usage stats are persisted to disk.
+	UsageStatisticsPersistEnabled bool `yaml:"usage-statistics-persist-enabled" json:"usage-statistics-persist-enabled"`
+	// UsageStatisticsSaveIntervalSeconds controls how often usage stats are persisted to disk.
+	// When <= 0, periodic persistence is disabled.
+	UsageStatisticsSaveIntervalSeconds int `yaml:"usage-statistics-save-interval-seconds" json:"usage-statistics-save-interval-seconds"`
 
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
@@ -503,6 +508,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.UsageStatisticsEnabled = false
+	cfg.UsageStatisticsPersistEnabled = false
+	cfg.UsageStatisticsSaveIntervalSeconds = 60
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
