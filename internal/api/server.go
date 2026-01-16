@@ -969,6 +969,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 
 	s.handlers.UpdateClients(&cfg.SDKConfig)
+	if s.handlers != nil {
+		s.handlers.UpdateModelMappings(cfg.AmpCode.ModelMappings)
+	}
 
 	if !cfg.RemoteManagement.DisableControlPanel {
 		staticDir := managementasset.StaticDir(s.configFilePath)

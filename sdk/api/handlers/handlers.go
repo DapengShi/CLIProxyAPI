@@ -16,11 +16,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/modelmapping"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/context"
 )
 
@@ -177,6 +180,8 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	modelMapper *modelmapping.DefaultModelMapper
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -189,10 +194,12 @@ type BaseAPIHandler struct {
 // Returns:
 //   - *BaseAPIHandler: A new API handlers instance
 func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *BaseAPIHandler {
-	return &BaseAPIHandler{
+	h := &BaseAPIHandler{
 		Cfg:         cfg,
 		AuthManager: authManager,
+		modelMapper: modelmapping.NewModelMapper(nil),
 	}
+	return h
 }
 
 // UpdateClients updates the handlers' client list and configuration.
@@ -201,7 +208,20 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 // Parameters:
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
-func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) {
+	h.Cfg = cfg
+}
+
+// UpdateModelMappings refreshes model mapping configuration for global fallback.
+func (h *BaseAPIHandler) UpdateModelMappings(mappings []config.AmpModelMapping) {
+	if h == nil {
+		return
+	}
+	if h.modelMapper == nil {
+		h.modelMapper = modelmapping.NewModelMapper(nil)
+	}
+	h.modelMapper.UpdateMappings(mappings)
+}
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.
@@ -379,9 +399,27 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	resp, errMsg := h.executeWithGlobalFallback(ctx, handlerType, modelName, rawJSON, alt, func(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+		return h.AuthManager.Execute(ctx, providers, req, opts)
+	})
 	if errMsg != nil {
 		return nil, errMsg
+	}
+	return cloneBytes(resp.Payload), nil
+}
+
+type fallbackCandidate struct {
+	model     string
+	baseModel string
+	providers []string
+	metadata  map[string]any
+	payload   []byte
+}
+
+func (h *BaseAPIHandler) executeWithGlobalFallback(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execute func(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error)) (coreexecutor.Response, *interfaces.ErrorMessage) {
+	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	if errMsg != nil {
+		return coreexecutor.Response{}, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	req := coreexecutor.Request{
@@ -398,62 +436,53 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
-	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
-	if err != nil {
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+
+	resp, err := execute(ctx, providers, req, opts)
+	if err == nil {
+		return resp, nil
 	}
-	return cloneBytes(resp.Payload), nil
+	originalErr := errorMessageFromError(err)
+	if originalErr == nil || originalErr.StatusCode != http.StatusTooManyRequests {
+		return coreexecutor.Response{}, originalErr
+	}
+
+	candidates := h.buildFallbackCandidates(modelName, normalizedModel, rawJSON)
+	if len(candidates) == 0 {
+		return coreexecutor.Response{}, originalErr
+	}
+
+	for _, candidate := range candidates {
+		req.Model = candidate.baseModel
+		req.Payload = cloneBytes(candidate.payload)
+		if cloned := cloneMetadata(candidate.metadata); cloned != nil {
+			req.Metadata = cloned
+		} else {
+			req.Metadata = nil
+		}
+		opts.Metadata = mergeMetadata(cloneMetadata(candidate.metadata), reqMeta)
+		resp, err = execute(ctx, candidate.providers, req, opts)
+		if err == nil {
+			return resp, nil
+		}
+		candidateErr := errorMessageFromError(err)
+		if candidateErr == nil {
+			candidateErr = &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: err}
+		}
+		if candidateErr.StatusCode != http.StatusTooManyRequests {
+			return coreexecutor.Response{}, candidateErr
+		}
+	}
+	return coreexecutor.Response{}, originalErr
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-	providers, normalizedModel, metadata, errMsg := h.getRequestDetails(modelName)
+	resp, errMsg := h.executeWithGlobalFallback(ctx, handlerType, modelName, rawJSON, alt, func(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+		return h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+	})
 	if errMsg != nil {
 		return nil, errMsg
-	}
-	reqMeta := requestExecutionMetadata(ctx)
-	req := coreexecutor.Request{
-		Model:   normalizedModel,
-		Payload: cloneBytes(rawJSON),
-	}
-	if cloned := cloneMetadata(metadata); cloned != nil {
-		req.Metadata = cloned
-	}
-	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-	}
-	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
-	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
-	if err != nil {
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
 	return cloneBytes(resp.Payload), nil
 }
@@ -468,48 +497,32 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, errChan
 	}
+	candidates := []fallbackCandidate{
+		{
+			model:     modelName,
+			baseModel: normalizedModel,
+			providers: providers,
+			metadata:  cloneMetadata(metadata),
+			payload:   cloneBytes(rawJSON),
+		},
+	}
+	candidates = append(candidates, h.buildFallbackCandidates(modelName, normalizedModel, rawJSON)...)
+
 	reqMeta := requestExecutionMetadata(ctx)
-	req := coreexecutor.Request{
-		Model:   normalizedModel,
-		Payload: cloneBytes(rawJSON),
-	}
-	if cloned := cloneMetadata(metadata); cloned != nil {
-		req.Metadata = cloned
-	}
-	opts := coreexecutor.Options{
+	baseOpts := coreexecutor.Options{
 		Stream:          true,
 		Alt:             alt,
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
-	opts.Metadata = mergeMetadata(cloneMetadata(metadata), reqMeta)
-	chunks, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-	if err != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
-		close(errChan)
-		return nil, errChan
-	}
+
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
-		sentPayload := false
-		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		var originalErr *interfaces.ErrorMessage
 
 		bootstrapEligible := func(err error) bool {
 			status := statusFromError(err)
@@ -525,8 +538,40 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			}
 		}
 
-	outer:
-		for {
+	candidateLoop:
+		for i, candidate := range candidates {
+			sentPayload := false
+			bootstrapRetries := 0
+			req := coreexecutor.Request{
+				Model:   candidate.baseModel,
+				Payload: cloneBytes(candidate.payload),
+			}
+			if cloned := cloneMetadata(candidate.metadata); cloned != nil {
+				req.Metadata = cloned
+			}
+			opts := baseOpts
+			opts.Metadata = mergeMetadata(cloneMetadata(candidate.metadata), reqMeta)
+
+			chunks, err := h.AuthManager.ExecuteStream(ctx, candidate.providers, req, opts)
+			if err != nil {
+				candidateErr := errorMessageFromError(err)
+				if candidateErr != nil && candidateErr.StatusCode == http.StatusTooManyRequests {
+					if originalErr == nil {
+						originalErr = candidateErr
+					}
+					if i < len(candidates)-1 {
+						continue candidateLoop
+					}
+					errChan <- originalErr
+					return
+				}
+				if candidateErr == nil {
+					candidateErr = &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: err}
+				}
+				errChan <- candidateErr
+				return
+			}
+
 			for {
 				var chunk coreexecutor.StreamChunk
 				var ok bool
@@ -544,33 +589,34 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 				}
 				if chunk.Err != nil {
 					streamErr := chunk.Err
-					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
-					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
-							retryChunks, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+							retryChunks, retryErr := h.AuthManager.ExecuteStream(ctx, candidate.providers, req, opts)
 							if retryErr == nil {
 								chunks = retryChunks
-								continue outer
+								continue
 							}
 							streamErr = retryErr
 						}
-					}
-
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
+						if statusFromError(streamErr) == http.StatusTooManyRequests {
+							if originalErr == nil {
+								originalErr = errorMessageFromError(streamErr)
+							}
+							if i < len(candidates)-1 {
+								continue candidateLoop
+							}
+							if originalErr != nil {
+								errChan <- originalErr
+								return
+							}
 						}
 					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
+					msg := errorMessageFromError(streamErr)
+					if msg == nil {
+						msg = &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: streamErr}
 					}
-					errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon}
+					errChan <- msg
 					return
 				}
 				if len(chunk.Payload) > 0 {
@@ -578,6 +624,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					dataChan <- cloneBytes(chunk.Payload)
 				}
 			}
+		}
+		if originalErr != nil {
+			errChan <- originalErr
 		}
 	}()
 	return dataChan, errChan
@@ -593,6 +642,112 @@ func statusFromError(err error) int {
 		}
 	}
 	return 0
+}
+
+func errorMessageFromError(err error) *interfaces.ErrorMessage {
+	if err == nil {
+		return nil
+	}
+	status := http.StatusInternalServerError
+	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			status = code
+		}
+	}
+	var addon http.Header
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if hdr := he.Headers(); hdr != nil {
+			addon = hdr.Clone()
+		}
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+}
+
+func (h *BaseAPIHandler) buildFallbackCandidates(requestedModel, normalizedModel string, rawJSON []byte) []fallbackCandidate {
+	if h == nil || h.modelMapper == nil {
+		return nil
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	normalizedModel = strings.TrimSpace(normalizedModel)
+	if requestedModel == "" || normalizedModel == "" {
+		return nil
+	}
+
+	thinkingSuffix := ""
+	if strings.HasPrefix(requestedModel, normalizedModel) {
+		thinkingSuffix = requestedModel[len(normalizedModel):]
+	}
+
+	mappedModels := h.modelMapper.MapModelCandidates(requestedModel)
+	if len(mappedModels) == 0 && !strings.EqualFold(requestedModel, normalizedModel) {
+		mappedModels = h.modelMapper.MapModelCandidates(normalizedModel)
+	}
+	if len(mappedModels) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(mappedModels))
+	candidates := make([]fallbackCandidate, 0, len(mappedModels))
+	for _, mapped := range mappedModels {
+		mapped = strings.TrimSpace(mapped)
+		if mapped == "" {
+			continue
+		}
+		if thinkingSuffix != "" {
+			_, mappedMetadata := util.NormalizeThinkingModel(mapped)
+			if mappedMetadata == nil {
+				mapped += thinkingSuffix
+			}
+		}
+
+		baseModel, mappedMetadata := util.NormalizeThinkingModel(mapped)
+		baseModel = strings.TrimSpace(baseModel)
+		if baseModel == "" {
+			continue
+		}
+		if strings.EqualFold(baseModel, normalizedModel) {
+			continue
+		}
+		key := strings.ToLower(baseModel)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+
+		providers := util.GetProviderName(baseModel)
+		if len(providers) == 0 {
+			continue
+		}
+
+		metadata := cloneMetadata(mappedMetadata)
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		metadata[util.ModelMappingOriginalModelMetadataKey] = requestedModel
+
+		seen[key] = struct{}{}
+		candidates = append(candidates, fallbackCandidate{
+			model:     mapped,
+			baseModel: baseModel,
+			providers: providers,
+			metadata:  metadata,
+			payload:   rewriteModelInRequest(rawJSON, mapped),
+		})
+	}
+	return candidates
+}
+
+func rewriteModelInRequest(body []byte, newModel string) []byte {
+	if newModel == "" {
+		return body
+	}
+	if !gjson.GetBytes(body, "model").Exists() {
+		return body
+	}
+	updated, err := sjson.SetBytes(body, "model", newModel)
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, metadata map[string]any, err *interfaces.ErrorMessage) {
