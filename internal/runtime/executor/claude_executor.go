@@ -597,6 +597,7 @@ func ensureMaxTokensForThinking(modelName string, body []byte) []byte {
 // when assistant messages don't start with a thinking block
 var redactedThinkingBlock = map[string]interface{}{
 	"type": "redacted_thinking",
+	"data": "UmVkYWN0ZWQ=", // Base64 encoded placeholder for "Redacted"
 }
 
 // ensureAssistantMessagesHaveThinkingBlock ensures all assistant messages start with a thinking block
