@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"time"
 
@@ -240,7 +241,10 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			proxy := fh.getProxy()
 			if proxy != nil {
 				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				// Ensure Claude requests have thinking blocks before proxying
+				proxyBody := ensureThinkingBlocksForProxy(bodyBytes, modelName)
+				c.Request.Body = io.NopCloser(bytes.NewReader(proxyBody))
+				c.Request.ContentLength = int64(len(proxyBody))
 				proxy.ServeHTTP(c.Writer, c.Request)
 				return
 			}
@@ -327,7 +331,10 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 				log.Warnf("amp chain fallback: all local candidates exhausted, forwarding to ampcode.com")
 				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
 				c.Writer = originalWriter
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				// Ensure Claude requests have thinking blocks before proxying
+				proxyBody := ensureThinkingBlocksForProxy(bodyBytes, modelName)
+				c.Request.Body = io.NopCloser(bytes.NewReader(proxyBody))
+				c.Request.ContentLength = int64(len(proxyBody))
 				proxy.ServeHTTP(c.Writer, c.Request)
 				return
 			}
@@ -460,4 +467,79 @@ func extractModelFromRequest(body []byte, c *gin.Context) string {
 	}
 
 	return ""
+}
+
+// redactedThinkingBlock is used for injection when assistant messages don't start with a thinking block
+var redactedThinkingBlock = map[string]interface{}{
+	"type": "redacted_thinking",
+	"data": "UmVkYWN0ZWQ=", // Base64 encoded placeholder
+}
+
+// ensureThinkingBlocksForProxy ensures Claude requests have proper thinking blocks
+// before being proxied to ampcode.com. This prevents Anthropic API errors when
+// thinking is enabled but assistant messages don't start with thinking blocks.
+func ensureThinkingBlocksForProxy(body []byte, modelName string) []byte {
+	// Only process Claude models
+	if !strings.Contains(strings.ToLower(modelName), "claude") {
+		return body
+	}
+
+	// Check if thinking is enabled
+	thinkingType := gjson.GetBytes(body, "thinking.type").String()
+	if thinkingType != "enabled" {
+		return body
+	}
+
+	// Iterate through messages to check assistant messages
+	messagesResult := gjson.GetBytes(body, "messages")
+	if !messagesResult.Exists() || !messagesResult.IsArray() {
+		return body
+	}
+
+	messages := messagesResult.Array()
+	modifiedCount := 0
+
+	for i, msg := range messages {
+		role := msg.Get("role").String()
+		if role != "assistant" {
+			continue
+		}
+
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		contentArray := content.Array()
+		if len(contentArray) == 0 {
+			continue
+		}
+
+		// Check if first content block is a thinking block
+		firstType := contentArray[0].Get("type").String()
+		if firstType == "thinking" || firstType == "redacted_thinking" {
+			continue
+		}
+
+		// Build new content array with thinking block first
+		newContent := make([]interface{}, 0, len(contentArray)+1)
+		newContent = append(newContent, redactedThinkingBlock)
+		for _, c := range contentArray {
+			newContent = append(newContent, c.Value())
+		}
+
+		var err error
+		body, err = sjson.SetBytes(body, "messages."+strconv.Itoa(i)+".content", newContent)
+		if err != nil {
+			log.Warnf("ensureThinkingBlocksForProxy: failed to inject thinking block at message %d: %v", i, err)
+			continue
+		}
+		modifiedCount++
+	}
+
+	if modifiedCount > 0 {
+		log.Debugf("ensureThinkingBlocksForProxy: injected %d thinking block(s) for proxy request", modifiedCount)
+	}
+
+	return body
 }
