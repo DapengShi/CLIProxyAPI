@@ -17,6 +17,16 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// RequestLogRetentionDays specifies how many days to keep request log files.
+	// Logs older than this will be deleted during cleanup. Set to 0 to disable time-based cleanup.
+	// Default is 7 days.
+	RequestLogRetentionDays int `yaml:"request-log-retention-days,omitempty" json:"request-log-retention-days,omitempty"`
+
+	// RequestLogMaxTotalSizeMB specifies the maximum total size (in MB) for all request log files.
+	// When exceeded, the oldest logs are deleted until within the limit. Set to 0 to disable size-based cleanup.
+	// Default is 100 MB.
+	RequestLogMaxTotalSizeMB int `yaml:"request-log-max-total-size-mb,omitempty" json:"request-log-max-total-size-mb,omitempty"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
