@@ -59,6 +59,10 @@ usage-statistics-persist-enabled: false
 # How often to persist usage statistics to disk (seconds). Set <= 0 to disable.
 usage-statistics-save-interval-seconds: 60
 
+# How many days of detailed request information to retain when persisting to disk.
+# Details older than this are stripped during save. Set <= 0 to use default (30 days).
+usage-statistics-detail-retention-days: 30
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
 
