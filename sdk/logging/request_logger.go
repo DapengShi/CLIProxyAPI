@@ -13,6 +13,6 @@ type StreamingLogWriter = internallogging.StreamingLogWriter
 type FileRequestLogger = internallogging.FileRequestLogger
 
 // NewFileRequestLogger creates a new file-based request logger.
-func NewFileRequestLogger(enabled bool, logsDir string, configDir string) *FileRequestLogger {
-	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir)
+func NewFileRequestLogger(enabled bool, logsDir string, configDir string, retentionDays int, maxTotalSizeMB int) *FileRequestLogger {
+	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, retentionDays, maxTotalSizeMB)
 }
