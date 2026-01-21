@@ -60,7 +60,14 @@ type ServerOption func(*serverOptionConfig)
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
-	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
+	return logging.NewFileRequestLoggerWithCleanupOptions(
+		cfg.RequestLog,
+		logsDir,
+		configDir,
+		cfg.ErrorLogsMaxFiles,
+		cfg.RequestLogRetentionDays,
+		cfg.RequestLogMaxTotalSizeMB,
+	)
 }
 
 // WithMiddleware appends additional Gin middleware during server construction.
@@ -910,6 +917,15 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
 		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
 			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
+		}
+	}
+	if s.requestLogger != nil && (oldCfg == nil ||
+		oldCfg.RequestLogRetentionDays != cfg.RequestLogRetentionDays ||
+		oldCfg.RequestLogMaxTotalSizeMB != cfg.RequestLogMaxTotalSizeMB) {
+		if setter, ok := s.requestLogger.(interface {
+			SetRequestLogCleanupOptions(int, int)
+		}); ok {
+			setter.SetRequestLogCleanupOptions(cfg.RequestLogRetentionDays, cfg.RequestLogMaxTotalSizeMB)
 		}
 	}
 
