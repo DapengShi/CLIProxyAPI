@@ -68,6 +68,9 @@ type Config struct {
 	// UsageStatisticsSaveIntervalSeconds controls how often usage stats are persisted to disk.
 	// When <= 0, periodic persistence is disabled.
 	UsageStatisticsSaveIntervalSeconds int `yaml:"usage-statistics-save-interval-seconds" json:"usage-statistics-save-interval-seconds"`
+	// UsageStatisticsDetailRetentionDays controls how many days of detailed request information to retain in persistence.
+	// Details older than this threshold are stripped during save. When <= 0, defaults to 30 days.
+	UsageStatisticsDetailRetentionDays int `yaml:"usage-statistics-detail-retention-days" json:"usage-statistics-detail-retention-days"`
 
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
