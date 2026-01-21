@@ -556,3 +556,54 @@ func formatHour(hour int) string {
 	}
 	return strconv.Itoa(hour)
 }
+
+// CleanupOldDetails removes request details older than the specified retention period from memory.
+// This reduces memory footprint and improves SaveToFile performance by avoiding copying stale data.
+// retentionDays controls how many days of history to keep. When <= 0, defaults to 30 days.
+// Returns statistics about the cleanup operation.
+func (s *RequestStatistics) CleanupOldDetails(retentionDays int) CleanupStats {
+	result := CleanupStats{}
+	if s == nil {
+		return result
+	}
+	if retentionDays <= 0 {
+		retentionDays = 30
+	}
+	cutoffTime := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, apiStats := range s.apis {
+		for _, modelStats := range apiStats.Models {
+			if len(modelStats.Details) == 0 {
+				continue
+			}
+
+			beforeCount := len(modelStats.Details)
+			result.TotalDetailsBefore += int64(beforeCount)
+
+			// Filter details in-place to keep only recent ones
+			filtered := make([]RequestDetail, 0, beforeCount)
+			for _, detail := range modelStats.Details {
+				if detail.Timestamp.After(cutoffTime) {
+					filtered = append(filtered, detail)
+				}
+			}
+
+			modelStats.Details = filtered
+			afterCount := len(filtered)
+			result.TotalDetailsAfter += int64(afterCount)
+			result.DetailsRemoved += int64(beforeCount - afterCount)
+		}
+	}
+
+	return result
+}
+
+// CleanupStats contains statistics about a cleanup operation.
+type CleanupStats struct {
+	TotalDetailsBefore int64 `json:"total_details_before"`
+	TotalDetailsAfter  int64 `json:"total_details_after"`
+	DetailsRemoved     int64 `json:"details_removed"`
+}

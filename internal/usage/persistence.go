@@ -51,12 +51,14 @@ func (s *RequestStatistics) LoadFromFile(path string) error {
 }
 
 // SaveToFile persists the current statistics snapshot to disk.
-func (s *RequestStatistics) SaveToFile(path string) error {
+// retentionDays controls how many days of detailed request information to retain.
+// When <= 0, defaults to 30 days.
+func (s *RequestStatistics) SaveToFile(path string, retentionDays int) error {
 	if s == nil || path == "" {
 		return nil
 	}
 	snapshot := s.Snapshot()
-	stripRequestDetails(&snapshot)
+	stripRequestDetails(&snapshot, retentionDays)
 
 	payload := ExportPayload{
 		Version:    1,
@@ -86,7 +88,9 @@ func (s *RequestStatistics) SaveToFile(path string) error {
 }
 
 // StartAutoSave periodically persists usage statistics until context is canceled.
-func (s *RequestStatistics) StartAutoSave(ctx context.Context, path string, interval time.Duration) {
+// retentionDays controls how many days of detailed request information to retain.
+// Memory cleanup is performed before each save to reduce memory footprint and improve performance.
+func (s *RequestStatistics) StartAutoSave(ctx context.Context, path string, interval time.Duration, retentionDays int) {
 	if s == nil || path == "" {
 		return
 	}
@@ -96,7 +100,7 @@ func (s *RequestStatistics) StartAutoSave(ctx context.Context, path string, inte
 	if interval <= 0 {
 		go func() {
 			<-ctx.Done()
-			_ = s.SaveToFile(path)
+			s.cleanupAndSave(path, retentionDays)
 		}()
 		return
 	}
@@ -106,30 +110,67 @@ func (s *RequestStatistics) StartAutoSave(ctx context.Context, path string, inte
 		for {
 			select {
 			case <-ticker.C:
-				if err := s.SaveToFile(path); err != nil {
-					log.WithError(err).Warn("failed to auto-save usage statistics")
-				}
+				s.cleanupAndSave(path, retentionDays)
 			case <-ctx.Done():
-				if err := s.SaveToFile(path); err != nil {
-					log.WithError(err).Warn("failed to save usage statistics on shutdown")
-				}
+				s.cleanupAndSave(path, retentionDays)
 				return
 			}
 		}
 	}()
 }
 
-func stripRequestDetails(snapshot *StatisticsSnapshot) {
+// cleanupAndSave performs memory cleanup before saving to improve performance.
+func (s *RequestStatistics) cleanupAndSave(path string, retentionDays int) {
+	// Clean up old details from memory first
+	stats := s.CleanupOldDetails(retentionDays)
+
+	// Log cleanup metrics if significant cleanup occurred
+	if stats.DetailsRemoved > 0 {
+		removalRatio := 0.0
+		if stats.TotalDetailsBefore > 0 {
+			removalRatio = float64(stats.DetailsRemoved) / float64(stats.TotalDetailsBefore)
+		}
+		log.WithFields(log.Fields{
+			"details_before": stats.TotalDetailsBefore,
+			"details_after":  stats.TotalDetailsAfter,
+			"details_removed": stats.DetailsRemoved,
+			"removal_ratio":  fmt.Sprintf("%.1f%%", removalRatio*100),
+		}).Info("usage statistics memory cleanup completed")
+	}
+
+	// Now save to file (much faster since old data is already removed)
+	if err := s.SaveToFile(path, retentionDays); err != nil {
+		log.WithError(err).Warn("failed to save usage statistics")
+	}
+}
+
+func stripRequestDetails(snapshot *StatisticsSnapshot, retentionDays int) {
 	if snapshot == nil || len(snapshot.APIs) == 0 {
 		return
 	}
+	if retentionDays <= 0 {
+		retentionDays = 30
+	}
+	cutoffTime := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+
 	for apiKey, apiStats := range snapshot.APIs {
 		if len(apiStats.Models) == 0 {
 			continue
 		}
 		models := make(map[string]ModelSnapshot, len(apiStats.Models))
 		for modelName, modelStats := range apiStats.Models {
-			modelStats.Details = nil
+			if len(modelStats.Details) == 0 {
+				models[modelName] = modelStats
+				continue
+			}
+			// Filter details to keep only those within retention window
+			filteredDetails := make([]RequestDetail, 0, len(modelStats.Details))
+			for _, detail := range modelStats.Details {
+				if detail.Timestamp.After(cutoffTime) {
+					filteredDetails = append(filteredDetails, detail)
+				}
+			}
+			modelStats.Details = filteredDetails
 			models[modelName] = modelStats
 		}
 		apiStats.Models = models

@@ -52,7 +52,8 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 			log.WithError(err).Warn("failed to load usage statistics")
 		}
 		interval := time.Duration(cfg.UsageStatisticsSaveIntervalSeconds) * time.Second
-		usage.GetRequestStatistics().StartAutoSave(runCtx, statsPath, interval)
+		retentionDays := cfg.UsageStatisticsDetailRetentionDays
+		usage.GetRequestStatistics().StartAutoSave(runCtx, statsPath, interval, retentionDays)
 	}
 
 	service, err := builder.Build()
