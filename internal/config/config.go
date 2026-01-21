@@ -151,6 +151,10 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+	// DisableAutoUpdate prevents the automatic download/update of the management panel asset.
+	// When true, the panel will only serve the local file and never fetch from GitHub.
+	// Useful for development when you want to use a locally built management panel.
+	DisableAutoUpdate bool `yaml:"disable-auto-update"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
