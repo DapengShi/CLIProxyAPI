@@ -16,10 +16,16 @@ type FileRequestLogger = internallogging.FileRequestLogger
 
 // NewFileRequestLogger creates a new file-based request logger with default error log retention (10 files).
 func NewFileRequestLogger(enabled bool, logsDir string, configDir string) *FileRequestLogger {
-	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, defaultErrorLogsMaxFiles)
+	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, defaultErrorLogsMaxFiles, 0, 0)
 }
 
 // NewFileRequestLoggerWithOptions creates a new file-based request logger with configurable error log retention.
 func NewFileRequestLoggerWithOptions(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int) *FileRequestLogger {
-	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, errorLogsMaxFiles)
+	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, errorLogsMaxFiles, 0, 0)
+}
+
+// NewFileRequestLoggerWithCleanupOptions creates a new file-based request logger with configurable
+// error-log retention plus request-log cleanup limits.
+func NewFileRequestLoggerWithCleanupOptions(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int, retentionDays int, maxTotalSizeMB int) *FileRequestLogger {
+	return internallogging.NewFileRequestLogger(enabled, logsDir, configDir, errorLogsMaxFiles, retentionDays, maxTotalSizeMB)
 }
