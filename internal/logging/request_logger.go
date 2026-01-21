@@ -156,6 +156,15 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 			logsDir = filepath.Join(configDir, logsDir)
 		}
 	}
+
+	// Set default values if not specified
+	if retentionDays == 0 {
+		retentionDays = 7 // Default: 7 days
+	}
+	if maxTotalSizeMB == 0 {
+		maxTotalSizeMB = 100 // Default: 100 MB
+	}
+
 	return &FileRequestLogger{
 		enabled:           enabled,
 		logsDir:           logsDir,
@@ -283,6 +292,13 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 	if force && !l.enabled {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
+		}
+	} else if l.enabled {
+		// Cleanup request logs based on retention and size limits
+		if deleted, errCleanup := l.CleanupRequestLogs(l.retentionDays, l.maxTotalSizeMB); errCleanup != nil {
+			log.WithError(errCleanup).Warn("failed to clean up request logs")
+		} else if deleted > 0 {
+			log.Debugf("cleaned up %d request log file(s)", deleted)
 		}
 	}
 
@@ -491,6 +507,112 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	}
 
 	return nil
+}
+
+// CleanupRequestLogs removes old request log files based on retention days and total size limits.
+// It applies both time-based and size-based cleanup strategies:
+// - Deletes logs older than retentionDays (if > 0)
+// - Deletes oldest logs when total size exceeds maxTotalSizeMB (if > 0)
+// Returns the number of files deleted and any error encountered.
+func (l *FileRequestLogger) CleanupRequestLogs(retentionDays int, maxTotalSizeMB int) (int, error) {
+	entries, errRead := os.ReadDir(l.logsDir)
+	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			return 0, nil
+		}
+		return 0, errRead
+	}
+
+	type logFileInfo struct {
+		name    string
+		path    string
+		size    int64
+		modTime time.Time
+	}
+
+	var files []logFileInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Only process request log files (exclude error logs, main.log, rotated logs, and temp files)
+		if strings.HasPrefix(name, "error-") ||
+			name == "main.log" ||
+			strings.HasPrefix(name, "main-") ||
+			strings.HasSuffix(name, ".tmp") ||
+			!strings.HasSuffix(name, ".log") {
+			continue
+		}
+
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			log.WithError(errInfo).Warnf("failed to read request log info: %s", name)
+			continue
+		}
+
+		files = append(files, logFileInfo{
+			name:    name,
+			path:    filepath.Join(l.logsDir, name),
+			size:    info.Size(),
+			modTime: info.ModTime(),
+		})
+	}
+
+	if len(files) == 0 {
+		return 0, nil
+	}
+
+	// Sort by modification time (oldest first)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+
+	deleted := 0
+	now := time.Now()
+
+	// Step 1: Time-based cleanup - remove files older than retention days
+	if retentionDays > 0 {
+		cutoffTime := now.AddDate(0, 0, -retentionDays)
+		for i := 0; i < len(files); i++ {
+			if files[i].modTime.Before(cutoffTime) {
+				if errRemove := os.Remove(files[i].path); errRemove != nil && !os.IsNotExist(errRemove) {
+					log.WithError(errRemove).Warnf("failed to remove old request log: %s", files[i].name)
+					continue
+				}
+				log.Debugf("removed request log (age): %s", files[i].name)
+				deleted++
+				// Mark as deleted by zeroing size
+				files[i].size = 0
+			}
+		}
+	}
+
+	// Step 2: Size-based cleanup - remove oldest files if total size exceeds limit
+	if maxTotalSizeMB > 0 {
+		maxBytes := int64(maxTotalSizeMB) * 1024 * 1024
+		var totalSize int64
+		for i := range files {
+			totalSize += files[i].size
+		}
+
+		if totalSize > maxBytes {
+			// Remove oldest files until under limit
+			for i := 0; i < len(files) && totalSize > maxBytes; i++ {
+				if files[i].size > 0 { // Skip already deleted files
+					if errRemove := os.Remove(files[i].path); errRemove != nil && !os.IsNotExist(errRemove) {
+						log.WithError(errRemove).Warnf("failed to remove request log for size limit: %s", files[i].name)
+						continue
+					}
+					log.Debugf("removed request log (size): %s", files[i].name)
+					totalSize -= files[i].size
+					deleted++
+				}
+			}
+		}
+	}
+
+	return deleted, nil
 }
 
 func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error) {

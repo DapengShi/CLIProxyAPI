@@ -58,6 +58,8 @@ type ServerOption func(*serverOptionConfig)
 
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
+	retentionDays := cfg.RequestLogRetentionDays
+	maxTotalSizeMB := cfg.RequestLogMaxTotalSizeMB
 	if base := util.WritablePath(); base != "" {
 		return logging.NewFileRequestLogger(cfg.RequestLog, filepath.Join(base, "logs"), configDir, cfg.ErrorLogsMaxFiles)
 	}
