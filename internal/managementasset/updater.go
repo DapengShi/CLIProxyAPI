@@ -184,6 +184,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		ctx = context.Background()
 	}
 
+	// Skip network sync when configuration explicitly disables automatic updates.
+	cfg := currentConfigPtr.Load()
+	if cfg != nil && cfg.RemoteManagement.DisableAutoUpdate {
+		log.Debug("management asset sync skipped: auto-update disabled by configuration")
+		return false
+	}
+
 	staticDir = strings.TrimSpace(staticDir)
 	if staticDir == "" {
 		log.Debug("management asset sync skipped: empty static directory")
