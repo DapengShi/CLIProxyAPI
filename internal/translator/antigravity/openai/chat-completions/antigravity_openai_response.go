@@ -8,6 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -27,6 +28,7 @@ type convertCliResponseToOpenAIChatParams struct {
 	FunctionIndex        int
 	SawToolCall          bool   // Tracks if any tool call was seen in the entire stream
 	UpstreamFinishReason string // Caches the upstream finish reason for final chunk
+	ToolIntentBuffer     *util.ToolIntentBuffer
 	SanitizedNameMap     map[string]string
 }
 
@@ -52,11 +54,15 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 		*param = &convertCliResponseToOpenAIChatParams{
 			UnixTimestamp:    0,
 			FunctionIndex:    0,
+			ToolIntentBuffer: util.NewToolIntentBuffer(),
 			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
 		}
 	}
 	if (*param).(*convertCliResponseToOpenAIChatParams).SanitizedNameMap == nil {
 		(*param).(*convertCliResponseToOpenAIChatParams).SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	}
+	if (*param).(*convertCliResponseToOpenAIChatParams).ToolIntentBuffer == nil {
+		(*param).(*convertCliResponseToOpenAIChatParams).ToolIntentBuffer = util.NewToolIntentBuffer()
 	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
@@ -148,10 +154,42 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 				// Handle text content, distinguishing between regular content and reasoning/thoughts.
 				if partResult.Get("thought").Bool() {
 					template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", textContent)
+					template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 				} else {
-					template, _ = sjson.SetBytes(template, "choices.0.delta.content", textContent)
+					flushableText, tagIntents := (*param).(*convertCliResponseToOpenAIChatParams).ToolIntentBuffer.Feed(textContent)
+					if flushableText != "" {
+						template, _ = sjson.SetBytes(template, "choices.0.delta.content", flushableText)
+						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+					}
+
+					if len(tagIntents) > 0 {
+						(*param).(*convertCliResponseToOpenAIChatParams).SawToolCall = true
+						toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
+						functionCallIndex := (*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex
+						if toolCallsResult.Exists() && toolCallsResult.IsArray() {
+							functionCallIndex = len(toolCallsResult.Array())
+						} else {
+							template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
+						}
+
+						for _, intent := range tagIntents {
+							functionCallTemplate := []byte(`{"id":"","index":0,"type":"function","function":{"name":"","arguments":""}}`)
+							functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+							functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
+							functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", intent.Name)
+							if len(intent.Arguments) > 0 {
+								if argsJSON, err := json.Marshal(intent.Arguments); err == nil {
+									functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", string(argsJSON))
+								}
+							}
+							template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+							template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
+							functionCallIndex++
+						}
+
+						(*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex = functionCallIndex
+					}
 				}
-				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			} else if functionCallResult.Exists() {
 				// Handle function call content.
 				(*param).(*convertCliResponseToOpenAIChatParams).SawToolCall = true // Persist across chunks

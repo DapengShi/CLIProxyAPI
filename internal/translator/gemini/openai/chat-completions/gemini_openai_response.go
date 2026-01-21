@@ -8,6 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -23,8 +24,9 @@ import (
 type convertGeminiResponseToOpenAIChatParams struct {
 	UnixTimestamp int64
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
-	FunctionIndex    map[int]int
-	SanitizedNameMap map[string]string
+	FunctionIndex     map[int]int
+	ToolIntentBuffers map[int]*util.ToolIntentBuffer
+	SanitizedNameMap  map[string]string
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -48,9 +50,10 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Initialize parameters if nil.
 	if *param == nil {
 		*param = &convertGeminiResponseToOpenAIChatParams{
-			UnixTimestamp:    0,
-			FunctionIndex:    make(map[int]int),
-			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			UnixTimestamp:     0,
+			FunctionIndex:     make(map[int]int),
+			ToolIntentBuffers: make(map[int]*util.ToolIntentBuffer),
+			SanitizedNameMap:  util.SanitizedToolNameMap(originalRequestRawJSON),
 		}
 	}
 
@@ -58,6 +61,9 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	p := (*param).(*convertGeminiResponseToOpenAIChatParams)
 	if p.FunctionIndex == nil {
 		p.FunctionIndex = make(map[int]int)
+	}
+	if p.ToolIntentBuffers == nil {
+		p.ToolIntentBuffers = make(map[int]*util.ToolIntentBuffer)
 	}
 	if p.SanitizedNameMap == nil {
 		p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
@@ -177,10 +183,48 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						// Handle text content, distinguishing between regular content and reasoning/thoughts.
 						if partResult.Get("thought").Bool() {
 							template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", text)
+							template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 						} else {
-							template, _ = sjson.SetBytes(template, "choices.0.delta.content", text)
+							buffer, exists := p.ToolIntentBuffers[candidateIndex]
+							if !exists {
+								buffer = util.NewToolIntentBuffer()
+								p.ToolIntentBuffers[candidateIndex] = buffer
+							}
+
+							flushableText, tagIntents := buffer.Feed(text)
+							if flushableText != "" {
+								template, _ = sjson.SetBytes(template, "choices.0.delta.content", flushableText)
+								template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+							}
+
+							if len(tagIntents) > 0 {
+								hasFunctionCall = true
+								toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
+								functionCallIndex := p.FunctionIndex[candidateIndex]
+								if toolCallsResult.Exists() && toolCallsResult.IsArray() {
+									functionCallIndex = len(toolCallsResult.Array())
+								} else {
+									template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
+								}
+
+								for _, intent := range tagIntents {
+									functionCallTemplate := []byte(`{"id":"","index":0,"type":"function","function":{"name":"","arguments":""}}`)
+									functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+									functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
+									functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", intent.Name)
+									if len(intent.Arguments) > 0 {
+										if argsJSON, err := json.Marshal(intent.Arguments); err == nil {
+											functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", string(argsJSON))
+										}
+									}
+									template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+									template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
+									functionCallIndex++
+								}
+
+								p.FunctionIndex[candidateIndex] = functionCallIndex
+							}
 						}
-						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 					} else if functionCallResult.Exists() {
 						// Handle function call content.
 						hasFunctionCall = true
@@ -402,6 +446,35 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 			if hasFunctionCall {
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", "tool_calls")
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", "tool_calls")
+			}
+
+			currentContent := gjson.GetBytes(choiceTemplate, "message.content").String()
+			if currentContent != "" {
+				remainingContent, tagIntents := util.ParseToolIntents(currentContent)
+				if len(tagIntents) > 0 {
+					choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", remainingContent)
+					toolCallsResult := gjson.GetBytes(choiceTemplate, "message.tool_calls")
+					if !toolCallsResult.Exists() || !toolCallsResult.IsArray() {
+						choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls", []byte(`[]`))
+					}
+
+					for _, intent := range tagIntents {
+						hasFunctionCall = true
+						functionCallItemTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
+						functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+						functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", intent.Name)
+						if len(intent.Arguments) > 0 {
+							if argsJSON, err := json.Marshal(intent.Arguments); err == nil {
+								functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", string(argsJSON))
+							}
+						}
+						choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.role", "assistant")
+						choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls.-1", functionCallItemTemplate)
+					}
+
+					choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", "tool_calls")
+					choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", "tool_calls")
+				}
 			}
 
 			// Append the constructed choice to the main choices array.
