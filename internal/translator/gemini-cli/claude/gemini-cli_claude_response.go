@@ -9,6 +9,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -30,7 +31,8 @@ type Params struct {
 	HasContent       bool // Tracks whether any content (text, thinking, or tool use) has been output
 
 	// Reverse map: sanitized Gemini function name → original Claude tool name.
-	ToolNameMap map[string]string
+	ToolNameMap      map[string]string
+	ToolIntentBuffer *util.ToolIntentBuffer
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -59,7 +61,13 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 			ResponseType:     0,
 			ResponseIndex:    0,
 			ToolNameMap:      util.SanitizedToolNameMap(originalRequestRawJSON),
+			ToolIntentBuffer: util.NewToolIntentBuffer(),
 		}
+	}
+
+	p := (*param).(*Params)
+	if p.ToolIntentBuffer == nil {
+		p.ToolIntentBuffer = util.NewToolIntentBuffer()
 	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
@@ -138,31 +146,55 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						(*param).(*Params).HasContent = true
 					}
 				} else {
-					// Process regular text content (user-visible output)
-					// Continue existing text block if already in content state
-					if (*param).(*Params).ResponseType == 1 {
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex)), "delta.text", partTextResult.String())
-						appendEvent("content_block_delta", string(data))
-						(*param).(*Params).HasContent = true
-					} else {
-						// Transition from another state to text content
-						// First, close any existing content block
-						if (*param).(*Params).ResponseType != 0 {
-							if (*param).(*Params).ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
-								// output = output + "\n\n\n"
+					textContent := partTextResult.String()
+					flushableText, tagIntents := p.ToolIntentBuffer.Feed(textContent)
+
+					if flushableText != "" {
+						if p.ResponseType == 1 {
+							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, p.ResponseIndex)), "delta.text", flushableText)
+							appendEvent("content_block_delta", string(data))
+							p.HasContent = true
+						} else {
+							if p.ResponseType != 0 {
+								appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
+								p.ResponseIndex++
 							}
-							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
-							(*param).(*Params).ResponseIndex++
+
+							appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, p.ResponseIndex))
+							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, p.ResponseIndex)), "delta.text", flushableText)
+							appendEvent("content_block_delta", string(data))
+							p.ResponseType = 1
+							p.HasContent = true
+						}
+					}
+
+					if len(tagIntents) > 0 {
+						usedTool = true
+						if p.ResponseType != 0 {
+							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
+							p.ResponseIndex++
+							p.ResponseType = 0
 						}
 
-						// Start a new text content block
-						appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, (*param).(*Params).ResponseIndex))
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex)), "delta.text", partTextResult.String())
-						appendEvent("content_block_delta", string(data))
-						(*param).(*Params).ResponseType = 1 // Set state to content
-						(*param).(*Params).HasContent = true
+						for _, intent := range tagIntents {
+							clientToolName := util.RestoreSanitizedToolName(p.ToolNameMap, intent.Name)
+							data := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, p.ResponseIndex))
+							data, _ = sjson.SetBytes(data, "content_block.id", util.SanitizeClaudeToolID(fmt.Sprintf("%s-%d-%d", clientToolName, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))))
+							data, _ = sjson.SetBytes(data, "content_block.name", clientToolName)
+							appendEvent("content_block_start", string(data))
+
+							if len(intent.Arguments) > 0 {
+								if argsJSON, err := json.Marshal(intent.Arguments); err == nil {
+									deltaData, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, p.ResponseIndex)), "delta.partial_json", string(argsJSON))
+									appendEvent("content_block_delta", string(deltaData))
+								}
+							}
+
+							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex))
+							p.ResponseIndex++
+							p.ResponseType = 0
+							p.HasContent = true
+						}
 					}
 				}
 			} else if functionCallResult.Exists() {
@@ -276,9 +308,29 @@ func ConvertGeminiCLIResponseToClaudeNonStream(_ context.Context, _ string, orig
 		if textBuilder.Len() == 0 {
 			return
 		}
-		block := []byte(`{"type":"text","text":""}`)
-		block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-		out, _ = sjson.SetRawBytes(out, "content.-1", block)
+
+		remainingText, tagIntents := util.ParseToolIntents(textBuilder.String())
+		if remainingText != "" {
+			block := []byte(`{"type":"text","text":""}`)
+			block, _ = sjson.SetBytes(block, "text", remainingText)
+			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+		}
+
+		for _, intent := range tagIntents {
+			hasToolCall = true
+			toolIDCounter++
+			clientToolName := util.RestoreSanitizedToolName(toolNameMap, intent.Name)
+			toolBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
+			toolBlock, _ = sjson.SetBytes(toolBlock, "id", util.SanitizeClaudeToolID(fmt.Sprintf("%s-%d", clientToolName, toolIDCounter)))
+			toolBlock, _ = sjson.SetBytes(toolBlock, "name", clientToolName)
+			if len(intent.Arguments) > 0 {
+				if argsJSON, err := json.Marshal(intent.Arguments); err == nil {
+					toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", argsJSON)
+				}
+			}
+			out, _ = sjson.SetRawBytes(out, "content.-1", toolBlock)
+		}
+
 		textBuilder.Reset()
 	}
 
