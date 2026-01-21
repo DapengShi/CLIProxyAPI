@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -23,6 +24,8 @@ type convertGeminiResponseToOpenAIChatParams struct {
 	UnixTimestamp int64
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
 	FunctionIndex map[int]int
+	// ToolIntentBuffers holds buffers for streaming tag-based tool intent parsing per candidate.
+	ToolIntentBuffers map[int]*util.ToolIntentBuffer
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -46,15 +49,19 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Initialize parameters if nil.
 	if *param == nil {
 		*param = &convertGeminiResponseToOpenAIChatParams{
-			UnixTimestamp: 0,
-			FunctionIndex: make(map[int]int),
+			UnixTimestamp:     0,
+			FunctionIndex:     make(map[int]int),
+			ToolIntentBuffers: make(map[int]*util.ToolIntentBuffer),
 		}
 	}
 
-	// Ensure the Map is initialized (handling cases where param might be reused from older context).
+	// Ensure the Maps are initialized (handling cases where param might be reused from older context).
 	p := (*param).(*convertGeminiResponseToOpenAIChatParams)
 	if p.FunctionIndex == nil {
 		p.FunctionIndex = make(map[int]int)
+	}
+	if p.ToolIntentBuffers == nil {
+		p.ToolIntentBuffers = make(map[int]*util.ToolIntentBuffer)
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -171,10 +178,65 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						// Handle text content, distinguishing between regular content and reasoning/thoughts.
 						if partResult.Get("thought").Bool() {
 							template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", text)
+							template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 						} else {
-							template, _ = sjson.Set(template, "choices.0.delta.content", text)
+							// Use ToolIntentBuffer for streaming tag-based tool intent parsing
+							buffer, exists := p.ToolIntentBuffers[candidateIndex]
+							if !exists {
+								buffer = util.NewToolIntentBuffer()
+								p.ToolIntentBuffers[candidateIndex] = buffer
+							}
+
+							flushableText, tagIntents := buffer.Feed(text)
+
+							// Emit flushable text as content delta
+							if flushableText != "" {
+								template, _ = sjson.Set(template, "choices.0.delta.content", flushableText)
+								template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+							}
+
+							// Emit tag-based tool intents as tool_calls deltas
+							if len(tagIntents) > 0 {
+								hasFunctionCall = true
+								toolCallsResult := gjson.Get(template, "choices.0.delta.tool_calls")
+
+								functionCallIndex := p.FunctionIndex[candidateIndex]
+
+								if toolCallsResult.Exists() && toolCallsResult.IsArray() {
+									functionCallIndex = len(toolCallsResult.Array())
+								} else {
+									template, _ = sjson.SetRaw(template, "choices.0.delta.tool_calls", `[]`)
+								}
+
+								for _, intent := range tagIntents {
+									functionCallTemplate := `{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`
+									functionCallTemplate, _ = sjson.Set(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+									functionCallTemplate, _ = sjson.Set(functionCallTemplate, "index", functionCallIndex)
+									functionCallTemplate, _ = sjson.Set(functionCallTemplate, "function.name", intent.Name)
+
+									// Convert arguments map to JSON string
+									if len(intent.Arguments) > 0 {
+										argsJSON := "{"
+										first := true
+										for k, v := range intent.Arguments {
+											if !first {
+												argsJSON += ","
+											}
+											argsJSON += fmt.Sprintf(`"%s":"%v"`, k, v)
+											first = false
+										}
+										argsJSON += "}"
+										functionCallTemplate, _ = sjson.SetRaw(functionCallTemplate, "function.arguments", argsJSON)
+									}
+
+									template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+									template, _ = sjson.SetRaw(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
+
+									functionCallIndex++
+									p.FunctionIndex[candidateIndex] = functionCallIndex
+								}
+							}
 						}
-						template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 					} else if functionCallResult.Exists() {
 						// Handle function call content.
 						hasFunctionCall = true
@@ -388,6 +450,48 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 							choiceTemplate, _ = sjson.Set(choiceTemplate, "message.role", "assistant")
 							choiceTemplate, _ = sjson.SetRaw(choiceTemplate, "message.images.-1", imagePayload)
 						}
+					}
+				}
+			}
+
+			// Parse tag-based tool intents from content
+			currentContent := gjson.Get(choiceTemplate, "message.content").String()
+			if currentContent != "" {
+				remainingContent, tagIntents := util.ParseToolIntents(currentContent)
+
+				if len(tagIntents) > 0 {
+					// Update content with tags removed
+					choiceTemplate, _ = sjson.Set(choiceTemplate, "message.content", remainingContent)
+
+					// Add tag-based tool intents to tool_calls
+					toolCallsResult := gjson.Get(choiceTemplate, "message.tool_calls")
+					if !toolCallsResult.Exists() || !toolCallsResult.IsArray() {
+						choiceTemplate, _ = sjson.SetRaw(choiceTemplate, "message.tool_calls", `[]`)
+					}
+
+					for _, intent := range tagIntents {
+						hasFunctionCall = true
+						functionCallItemTemplate := `{"id": "","type": "function","function": {"name": "","arguments": ""}}`
+						functionCallItemTemplate, _ = sjson.Set(functionCallItemTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+						functionCallItemTemplate, _ = sjson.Set(functionCallItemTemplate, "function.name", intent.Name)
+
+						// Convert arguments map to JSON string
+						if len(intent.Arguments) > 0 {
+							argsJSON := "{"
+							first := true
+							for k, v := range intent.Arguments {
+								if !first {
+									argsJSON += ","
+								}
+								argsJSON += fmt.Sprintf(`"%s":"%v"`, k, v)
+								first = false
+							}
+							argsJSON += "}"
+							functionCallItemTemplate, _ = sjson.SetRaw(functionCallItemTemplate, "function.arguments", argsJSON)
+						}
+
+						choiceTemplate, _ = sjson.Set(choiceTemplate, "message.role", "assistant")
+						choiceTemplate, _ = sjson.SetRaw(choiceTemplate, "message.tool_calls.-1", functionCallItemTemplate)
 					}
 				}
 			}

@@ -9,11 +9,13 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -25,6 +27,7 @@ type Params struct {
 	ResponseType     int
 	ResponseIndex    int
 	HasContent       bool // Tracks whether any content (text, thinking, or tool use) has been output
+	ToolIntentBuffer *util.ToolIntentBuffer
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -53,7 +56,13 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			HasFirstResponse: false,
 			ResponseType:     0,
 			ResponseIndex:    0,
+			ToolIntentBuffer: util.NewToolIntentBuffer(),
 		}
+	}
+
+	p := (*param).(*Params)
+	if p.ToolIntentBuffer == nil {
+		p.ToolIntentBuffer = util.NewToolIntentBuffer()
 	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
@@ -139,37 +148,84 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 						(*param).(*Params).HasContent = true
 					}
 				} else {
-					// Process regular text content (user-visible output)
-					// Continue existing text block
-					if (*param).(*Params).ResponseType == 1 {
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex), "delta.text", partTextResult.String())
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						(*param).(*Params).HasContent = true
-					} else {
-						// Transition from another state to text content
-						// First, close any existing content block
-						if (*param).(*Params).ResponseType != 0 {
-							if (*param).(*Params).ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
-								// output = output + "\n\n\n"
+					// Process regular text content (user-visible output) with tag-based tool intent parsing
+					textContent := partTextResult.String()
+					flushableText, tagIntents := p.ToolIntentBuffer.Feed(textContent)
+
+					// Handle flushable text content
+					if flushableText != "" {
+						// Continue existing text block
+						if p.ResponseType == 1 {
+							output = output + "event: content_block_delta\n"
+							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, p.ResponseIndex), "delta.text", flushableText)
+							output = output + fmt.Sprintf("data: %s\n\n\n", data)
+							p.HasContent = true
+						} else {
+							// Transition from another state to text content
+							// First, close any existing content block
+							if p.ResponseType != 0 {
+								if p.ResponseType == 2 {
+									// output = output + "event: content_block_delta\n"
+									// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, p.ResponseIndex)
+									// output = output + "\n\n\n"
+								}
+								output = output + "event: content_block_stop\n"
+								output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, p.ResponseIndex)
+								output = output + "\n\n\n"
+								p.ResponseIndex++
 							}
-							output = output + "event: content_block_stop\n"
-							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex)
+
+							// Start a new text content block
+							output = output + "event: content_block_start\n"
+							output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, p.ResponseIndex)
 							output = output + "\n\n\n"
-							(*param).(*Params).ResponseIndex++
+							output = output + "event: content_block_delta\n"
+							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, p.ResponseIndex), "delta.text", flushableText)
+							output = output + fmt.Sprintf("data: %s\n\n\n", data)
+							p.ResponseType = 1 // Set state to content
+							p.HasContent = true
+						}
+					}
+
+					// Handle tag-based tool intents
+					if len(tagIntents) > 0 {
+						usedTool = true
+
+						// Close current content block if any
+						if p.ResponseType != 0 {
+							output = output + "event: content_block_stop\n"
+							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, p.ResponseIndex)
+							output = output + "\n\n\n"
+							p.ResponseIndex++
+							p.ResponseType = 0
 						}
 
-						// Start a new text content block
-						output = output + "event: content_block_start\n"
-						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, (*param).(*Params).ResponseIndex)
-						output = output + "\n\n\n"
-						output = output + "event: content_block_delta\n"
-						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex), "delta.text", partTextResult.String())
-						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						(*param).(*Params).ResponseType = 1 // Set state to content
-						(*param).(*Params).HasContent = true
+						// Create tool_use content block for each intent
+						for _, intent := range tagIntents {
+							output = output + "event: content_block_start\n"
+							data := fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, p.ResponseIndex)
+							data, _ = sjson.Set(data, "content_block.id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1)))
+							data, _ = sjson.Set(data, "content_block.name", intent.Name)
+							output = output + fmt.Sprintf("data: %s\n\n\n", data)
+
+							// Convert arguments to JSON
+							if len(intent.Arguments) > 0 {
+								argsJSON, err := json.Marshal(intent.Arguments)
+								if err == nil {
+									output = output + "event: content_block_delta\n"
+									deltaData, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, p.ResponseIndex), "delta.partial_json", string(argsJSON))
+									output = output + fmt.Sprintf("data: %s\n\n\n", deltaData)
+								}
+							}
+
+							// Close the tool use block
+							output = output + "event: content_block_stop\n"
+							output = output + fmt.Sprintf(`data: {"type":"content_block_stop","index":%d}`, p.ResponseIndex)
+							output = output + "\n\n\n"
+							p.ResponseIndex++
+							p.ResponseType = 0
+							p.HasContent = true
+						}
 					}
 				}
 			} else if functionCallResult.Exists() {
@@ -302,9 +358,36 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 		if textBuilder.Len() == 0 {
 			return
 		}
-		block := `{"type":"text","text":""}`
-		block, _ = sjson.Set(block, "text", textBuilder.String())
-		out, _ = sjson.SetRaw(out, "content.-1", block)
+
+		// Parse tag-based tool intents from accumulated text
+		remainingText, tagIntents := util.ParseToolIntents(textBuilder.String())
+
+		// Output remaining text (with tags removed) if any
+		if remainingText != "" {
+			block := `{"type":"text","text":""}`
+			block, _ = sjson.Set(block, "text", remainingText)
+			out, _ = sjson.SetRaw(out, "content.-1", block)
+		}
+
+		// Output tag-based tool intents as tool_use blocks
+		for _, intent := range tagIntents {
+			hasToolCall = true
+			toolIDCounter++
+			toolBlock := `{"type":"tool_use","id":"","name":"","input":{}}`
+			toolBlock, _ = sjson.Set(toolBlock, "id", fmt.Sprintf("tool_%d", toolIDCounter))
+			toolBlock, _ = sjson.Set(toolBlock, "name", intent.Name)
+
+			// Convert arguments to JSON
+			if len(intent.Arguments) > 0 {
+				argsJSON, err := json.Marshal(intent.Arguments)
+				if err == nil {
+					toolBlock, _ = sjson.SetRaw(toolBlock, "input", string(argsJSON))
+				}
+			}
+
+			out, _ = sjson.SetRaw(out, "content.-1", toolBlock)
+		}
+
 		textBuilder.Reset()
 	}
 
