@@ -299,6 +299,14 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 		}
 	}
 
+	// Ensure role is set in all response strings where it might be missing
+	for i, resp := range responseStrings {
+		if gjson.Get(resp, "choices.0.delta.role").Type == gjson.Null {
+			resp, _ = sjson.Set(resp, "choices.0.delta.role", "assistant")
+			responseStrings[i] = resp
+		}
+	}
+
 	return responseStrings
 }
 
@@ -494,6 +502,12 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 			template, _ = sjson.SetRaw(template, "choices.-1", choiceTemplate)
 			return true
 		})
+	}
+
+	// If no choices were added (e.g. empty candidates array), add an empty assistant message
+	if len(gjson.Get(template, "choices").Array()) == 0 {
+		emptyChoice := `{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}`
+		template, _ = sjson.SetRaw(template, "choices.-1", emptyChoice)
 	}
 
 	return template

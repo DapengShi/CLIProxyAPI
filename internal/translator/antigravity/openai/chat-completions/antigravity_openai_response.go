@@ -257,6 +257,11 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 		template, _ = sjson.Set(template, "choices.0.native_finish_reason", "tool_calls")
 	}
 
+	// Ensure role is always assistant (even if all parts were skipped)
+	if gjson.Get(template, "choices.0.delta.role").Type == gjson.Null {
+		template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+	}
+
 	return []string{template}
 }
 
