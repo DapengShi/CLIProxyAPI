@@ -260,6 +260,10 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", strings.ToLower(upstreamFinishReason))
 	}
 
+	if gjson.GetBytes(template, "choices.0.delta.role").Type == gjson.Null {
+		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+	}
+
 	return [][]byte{template}
 }
 
