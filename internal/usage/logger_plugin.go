@@ -367,12 +367,6 @@ func (s *RequestStatistics) Replace(snapshot StatisticsSnapshot) {
 	if s == nil {
 		return
 	}
-	for _, apiSnapshot := range snapshot.APIs {
-		for modelName, modelSnapshot := range apiSnapshot.Models {
-			modelSnapshot.Details = nil
-			apiSnapshot.Models[modelName] = modelSnapshot
-		}
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,10 +382,12 @@ func (s *RequestStatistics) Replace(snapshot StatisticsSnapshot) {
 		if len(apiSnapshot.Models) > 0 {
 			stats.Models = make(map[string]*modelStats, len(apiSnapshot.Models))
 			for modelName, modelSnapshot := range apiSnapshot.Models {
+				details := make([]RequestDetail, len(modelSnapshot.Details))
+				copy(details, modelSnapshot.Details)
 				modelStatsValue := &modelStats{
 					TotalRequests: modelSnapshot.TotalRequests,
 					TotalTokens:   modelSnapshot.TotalTokens,
-					Details:       nil,
+					Details:       details,
 				}
 				stats.Models[modelName] = modelStatsValue
 			}
@@ -528,18 +524,12 @@ func normaliseDetail(detail coreusage.Detail) TokenStats {
 		TotalTokens:     detail.TotalTokens,
 	}
 	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
 	}
 	return tokens
 }
 
 func normaliseTokenStats(tokens TokenStats) TokenStats {
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
 	if tokens.TotalTokens == 0 {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}

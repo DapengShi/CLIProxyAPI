@@ -9,17 +9,50 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
-
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
 		snapshot = h.usageStats.Snapshot()
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"usage":           snapshot,
-		"failed_requests": snapshot.FailureCount,
-	})
+
+	// Transform the internal snapshot to the required external response format
+	response := gin.H{
+		"total_requests": snapshot.TotalRequests,
+		"total_tokens":   snapshot.TotalTokens,
+		"success_count":  snapshot.SuccessCount,
+		"failure_count":  snapshot.FailureCount,
+	}
+
+	apis := make(map[string]interface{})
+	for apiName, apiSnap := range snapshot.APIs {
+		models := make(map[string]interface{})
+		for modelName, modelSnap := range apiSnap.Models {
+			details := make([]gin.H, 0, len(modelSnap.Details))
+			for _, detail := range modelSnap.Details {
+				details = append(details, gin.H{
+					"timestamp":  detail.Timestamp.UTC().Format("2006-01-02T15:04:05.000Z"),
+					"source":     detail.Source,
+					"auth_index": detail.AuthIndex,
+					"tokens":     detail.Tokens,
+					"failed":     detail.Failed,
+				})
+			}
+			models[modelName] = gin.H{
+				"total_requests": modelSnap.TotalRequests,
+				"total_tokens":   modelSnap.TotalTokens,
+				"details":        details,
+			}
+		}
+		apis[apiName] = gin.H{
+			"total_requests": apiSnap.TotalRequests,
+			"total_tokens":   apiSnap.TotalTokens,
+			"models":         models,
+		}
+	}
+	response["apis"] = apis
+
+	c.JSON(http.StatusOK, response)
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.
