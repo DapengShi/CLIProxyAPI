@@ -101,6 +101,9 @@ type Config struct {
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
+	// PaCoReKey defines PaCoRe API key configurations.
+	PaCoReKey []PaCoReKey `yaml:"pacore-api-key" json:"pacore-api-key"`
+
 	// VertexCompatAPIKey defines Vertex AI-compatible API key configurations for third-party providers.
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
@@ -487,6 +490,50 @@ type OpenAICompatibilityModel struct {
 func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
 func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 
+// PaCoReKey represents the configuration for a PaCoRe API key.
+type PaCoReKey struct {
+	// APIKey is the authentication key for accessing PaCoRe API services.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/pacore-model").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// BaseURL is the base URL for the PaCoRe API endpoint.
+	// If empty, the default PaCoRe API URL will be used.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// ProxyURL overrides the global proxy setting for this API key if provided.
+	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []PaCoReModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+}
+
+func (k PaCoReKey) GetAPIKey() string  { return k.APIKey }
+func (k PaCoReKey) GetBaseURL() string { return k.BaseURL }
+
+// PaCoReModel describes a mapping between an alias and the actual upstream model name.
+type PaCoReModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m PaCoReModel) GetName() string  { return m.Name }
+func (m PaCoReModel) GetAlias() string { return m.Alias }
+
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
 // and returns it.
@@ -617,6 +664,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
+
+	// Sanitize PaCoRe keys: drop entries without base-url
+	cfg.SanitizePaCoReKeys()
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
@@ -760,6 +810,27 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		out = append(out, e)
 	}
 	cfg.OpenAICompatibility = out
+}
+
+// SanitizePaCoReKeys removes PaCoRe API key entries missing a BaseURL.
+// It trims whitespace and preserves order for remaining entries.
+func (cfg *Config) SanitizePaCoReKeys() {
+	if cfg == nil || len(cfg.PaCoReKey) == 0 {
+		return
+	}
+	out := make([]PaCoReKey, 0, len(cfg.PaCoReKey))
+	for i := range cfg.PaCoReKey {
+		e := cfg.PaCoReKey[i]
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		if e.BaseURL == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.PaCoReKey = out
 }
 
 // SanitizeCodexKeys removes Codex API key entries missing a BaseURL.

@@ -390,6 +390,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 		return
 	case "antigravity":
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
+	case "pacore":
+		s.coreManager.RegisterExecutor(executor.NewPaCoReExecutor("pacore", s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "codex":
@@ -773,6 +775,17 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
 		cancel()
 		models = applyExcludedModels(models, excluded)
+	case "pacore":
+		models = registry.GetOpenAIModels() // Or create GetPaCoReModels if specific default
+		if entry := s.resolveConfigPaCoReKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildPaCoReConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
@@ -1024,6 +1037,32 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	return nil
 }
 
+func (s *Service) resolveConfigPaCoReKey(auth *coreauth.Auth) *config.PaCoReKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.PaCoReKey {
+		entry := &s.cfg.PaCoReKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	return nil
+}
+
 func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 	cfg := s.cfg
 	if cfg == nil {
@@ -1213,6 +1252,13 @@ func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "google", "vertex")
+}
+
+func buildPaCoReConfigModels(entry *config.PaCoReKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "pacore", "pacore")
 }
 
 func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {

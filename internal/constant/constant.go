@@ -24,4 +24,7 @@ const (
 
 	// Antigravity represents the Antigravity response format identifier.
 	Antigravity = "antigravity"
+
+	// PaCoRe represents the PaCoRe provider identifier.
+	PaCoRe = "pacore"
 )
