@@ -330,12 +330,6 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
 		}
 	} else if l.enabled {
-		// Cleanup request logs based on retention and size limits
-		if deleted, errCleanup := l.CleanupRequestLogs(l.retentionDays, l.maxTotalSizeMB); errCleanup != nil {
-			log.WithError(errCleanup).Warn("failed to clean up request logs")
-		} else if deleted > 0 {
-			log.Debugf("cleaned up %d request log file(s)", deleted)
-		}
 	}
 
 	return nil

@@ -179,16 +179,11 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		ctx = context.Background()
 	}
 
-	if disableControlPanel.Load() {
-		log.Debug("management asset sync skipped: control panel disabled by configuration")
-		return
-	}
-
 	// Check if auto-update is disabled
 	cfg := currentConfigPtr.Load()
 	if cfg != nil && cfg.RemoteManagement.DisableAutoUpdate {
 		log.Debug("management asset sync skipped: auto-update disabled by configuration")
-		return
+		return false
 	}
 
 	staticDir = strings.TrimSpace(staticDir)
