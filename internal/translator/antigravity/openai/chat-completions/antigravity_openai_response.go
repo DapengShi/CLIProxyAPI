@@ -16,7 +16,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/chat-completions"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -49,15 +48,9 @@ var functionCallIDCounter uint64
 func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
 		*param = &convertCliResponseToOpenAIChatParams{
-			UnixTimestamp:    0,
-			FunctionIndex:    0,
-			ToolIntentBuffer: util.NewToolIntentBuffer(),
+			UnixTimestamp: 0,
+			FunctionIndex: 0,
 		}
-	}
-
-	p := (*param).(*convertCliResponseToOpenAIChatParams)
-	if p.ToolIntentBuffer == nil {
-		p.ToolIntentBuffer = util.NewToolIntentBuffer()
 	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
@@ -151,55 +144,10 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 					template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", textContent)
 					template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 				} else {
-					// Use ToolIntentBuffer for streaming tag-based tool intent parsing
-					flushableText, tagIntents := p.ToolIntentBuffer.Feed(textContent)
-
-					// Emit flushable text as content delta
-					if flushableText != "" {
-						template, _ = sjson.Set(template, "choices.0.delta.content", flushableText)
+					// Direct pass-through of text content
+					if textContent != "" {
+						template, _ = sjson.Set(template, "choices.0.delta.content", textContent)
 						template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
-					}
-
-					// Emit tag-based tool intents as tool_calls deltas
-					if len(tagIntents) > 0 {
-						hasFunctionCall = true
-						toolCallsResult := gjson.Get(template, "choices.0.delta.tool_calls")
-
-						functionCallIndex := p.FunctionIndex
-
-						if toolCallsResult.Exists() && toolCallsResult.IsArray() {
-							functionCallIndex = len(toolCallsResult.Array())
-						} else {
-							template, _ = sjson.SetRaw(template, "choices.0.delta.tool_calls", `[]`)
-						}
-
-						for _, intent := range tagIntents {
-							functionCallTemplate := `{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`
-							functionCallTemplate, _ = sjson.Set(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", intent.Name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
-							functionCallTemplate, _ = sjson.Set(functionCallTemplate, "index", functionCallIndex)
-							functionCallTemplate, _ = sjson.Set(functionCallTemplate, "function.name", intent.Name)
-
-							// Convert arguments map to JSON string
-							if len(intent.Arguments) > 0 {
-								argsJSON := "{"
-								first := true
-								for k, v := range intent.Arguments {
-									if !first {
-										argsJSON += ","
-									}
-									argsJSON += fmt.Sprintf(`"%s":"%v"`, k, v)
-									first = false
-								}
-								argsJSON += "}"
-								functionCallTemplate, _ = sjson.SetRaw(functionCallTemplate, "function.arguments", argsJSON)
-							}
-
-							template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
-							template, _ = sjson.SetRaw(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
-
-							functionCallIndex++
-							p.FunctionIndex = functionCallIndex
-						}
 					}
 				}
 			} else if functionCallResult.Exists() {
